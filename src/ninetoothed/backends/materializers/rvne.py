@@ -28,6 +28,7 @@ from ninetoothed.dtype import normalize_dtype
 
 _C_TYPES = {
     "bool": "bool",
+    "int4": "int8_t",
     "float32": "float",
     "float64": "double",
     **{
@@ -141,6 +142,9 @@ def _dtype(binding, specs):
     else:
         name = "int64"
 
+    if name == "int4":
+        name = "int8"
+
     if name not in _C_TYPES:
         raise TypeError(f"Unsupported RVNE ABI dtype `{name}`.")
     return name
@@ -248,6 +252,11 @@ def _validate(public, abi, specs):
 
         if not value.flags.c_contiguous:
             raise ValueError(f"RVNE tensor `{name}` must be C-contiguous.")
+
+        if normalize_dtype(str(spec["dtype"])) == "int4" and (
+            np.any(value < -8) or np.any(value > 7)
+        ):
+            raise ValueError(f"RVNE int4 tensor `{name}` values must be in [-8, 7].")
 
         if (
             binding.access in {"write", "read_write"} or name in abi.outputs

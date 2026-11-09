@@ -2,8 +2,6 @@
 
 from typing import TYPE_CHECKING, Any, Mapping
 
-import numpy as np
-
 from ninetoothed.backends.core import Artifact, Backend, Capability, Target
 from ninetoothed.compiler.passes import OptimizeSchedule
 from ninetoothed.dtype import normalize_dtype
@@ -13,7 +11,9 @@ if TYPE_CHECKING:
     from ninetoothed.compiler.passes import Registry
 
 
-_SUPPORTED_DTYPES = frozenset({"bool", "int32", "uint32", "int64", "uint64", "float32"})
+_SUPPORTED_DTYPES = frozenset(
+    {"bool", "int4", "int32", "uint32", "int64", "uint64", "float32"}
+)
 _SUPPORTED_OPCODES = frozenset(
     {
         "arith.constant",
@@ -72,7 +72,6 @@ _SUPPORTED_OPCODES = frozenset(
         "linalg.dot",
         "linalg.matmul",
         "math.exp2",
-        "call.spike_accumulate",
     }
 )
 
@@ -89,6 +88,7 @@ class RvneBackend(Backend):
         requires_external_compiler=True,
         notes=(
             "Emits RISC-V C++ for the RVNE Zne toolchain.",
+            "Lowers bool @ int4 contractions to calc_acc_32 without implicit quantization.",
             "AOT execution uses contiguous NumPy host arrays through QEMU.",
             "JIT execution and direct hardware execution are not implemented.",
         ),
@@ -153,8 +153,40 @@ def validate_kernel(kernel: Kernel) -> None:
     for block in kernel.ssa.blocks:
         _validate_block(block)
 
-    _validate_spike_accumulators(kernel.ssa)
     _validate_float_math(kernel.ssa)
+    _validate_int4_usage(kernel.ssa)
+
+
+def _validate_int4_usage(program: ssa.Program) -> None:
+    from ninetoothed.backends.emitters.analysis import program_value_types, walk_ops
+
+    value_types = program_value_types(program)
+
+    for block in program.blocks:
+        for operation in walk_ops(block.operations):
+            operand_types = tuple(
+                value_types[name] for name in operation.operands if name in value_types
+            )
+            uses_int4 = any(
+                normalize_dtype(type_.dtype) == "int4" for type_ in operand_types
+            )
+
+            if not uses_int4:
+                continue
+
+            if operation.opcode not in {"linalg.dot", "linalg.matmul"}:
+                raise ValueError(
+                    "RVNE int4 values are only valid in bool @ int4 contractions."
+                )
+
+            if (
+                normalize_dtype(operand_types[0].dtype) != "bool"
+                or normalize_dtype(operand_types[1].dtype) != "int4"
+                or normalize_dtype(operation.results[0].type.dtype) != "int32"
+            ):
+                raise ValueError(
+                    "RVNE requires a bool lhs and int4 rhs for int4 contractions."
+                )
 
 
 def _validate_float_math(program: ssa.Program) -> None:
@@ -200,59 +232,6 @@ def _validate_float_math(program: ssa.Program) -> None:
                 )
 
 
-def _validate_spike_accumulators(program: ssa.Program) -> None:
-    from ninetoothed.backends.emitters.analysis import program_value_types, walk_ops
-
-    value_types = program_value_types(program)
-    expected = ("int32", "uint32", "uint64", "uint64")
-
-    for block in program.blocks:
-        for operation in walk_ops(block.operations):
-            if operation.opcode != "call.spike_accumulate":
-                continue
-
-            if len(operation.operands) != 4 or len(operation.results) != 1:
-                raise ValueError("RVNE spike_accumulate requires four operands.")
-
-            types = tuple(value_types[name] for name in operation.operands)
-
-            if any(type_.kind not in {"scalar", "tensor"} for type_ in types):
-                raise TypeError(
-                    "RVNE spike_accumulate requires scalar or tensor values."
-                )
-
-            if tuple(normalize_dtype(type_.dtype) for type_ in types) != expected:
-                raise TypeError(
-                    "RVNE spike_accumulate requires int32 current, uint32 spikes, "
-                    "and two uint64 packed weight words."
-                )
-
-            result = operation.results[0].type
-
-            if (
-                normalize_dtype(result.dtype) != "int32"
-                or result.shape != types[0].shape
-            ):
-                raise TypeError(
-                    "RVNE spike_accumulate must return the current's int32 shape."
-                )
-
-            if any(not _broadcasts_to(type_.shape, result.shape) for type_ in types):
-                raise ValueError(
-                    "RVNE spike_accumulate operands must broadcast to the current shape."
-                )
-
-
-def _broadcasts_to(shape, target_shape):
-    if len(shape) > len(target_shape):
-        return False
-
-    return all(
-        str(size) == "1" or str(size) == str(target)
-        for size, target in zip(reversed(shape), reversed(target_shape))
-    )
-
-
 def _validate_block(block: ssa.Block) -> None:
     for value in block.args:
         _validate_value(value)
@@ -296,53 +275,3 @@ def register_ssa_passes(registry: "Registry") -> None:
         backend=Target.RVNE,
         optimize_schedule=RvneOptimizeSchedule,
     )
-
-
-def pack_spikes(values):
-    """Pack the last axis into uint32 words, with the first spike in bit zero.
-
-    Values must already be binary. The final word is padded with zero spikes;
-    this function never thresholds or quantizes an input tensor.
-    """
-    values = np.asarray(values)
-    _validate_integer_array(values)
-
-    if np.any((values != 0) & (values != 1)):
-        raise ValueError("RVNE spikes must contain only zero and one.")
-
-    return _pack(values, lanes=32, bits=1, dtype=np.uint32)
-
-
-def pack_weights(values):
-    """Pack signed INT4 weights into uint64 words, lowest nibble first.
-
-    Each word holds sixteen two's-complement weights. The final word is padded
-    with zero weights. Inputs must be integers in [-8, 7]; quantization belongs
-    to the caller and is never performed implicitly.
-    """
-    values = np.asarray(values)
-    _validate_integer_array(values)
-
-    if np.any(values < -8) or np.any(values > 7):
-        raise ValueError("RVNE weights must be signed INT4 integers in [-8, 7].")
-
-    return _pack(values, lanes=16, bits=4, dtype=np.uint64)
-
-
-def _validate_integer_array(values):
-    if values.ndim == 0:
-        raise ValueError("RVNE packing requires an array with at least one axis.")
-
-    if values.dtype.kind not in "biu":
-        raise TypeError("RVNE packing requires integer or boolean input values.")
-
-
-def _pack(values, *, lanes, bits, dtype):
-    count = values.shape[-1]
-    words = (count + lanes - 1) // lanes
-    padded = np.zeros((*values.shape[:-1], words * lanes), dtype=dtype)
-    padded[..., :count] = values.astype(dtype) & dtype((1 << bits) - 1)
-    padded = padded.reshape((*values.shape[:-1], words, lanes))
-    shifts = np.arange(lanes, dtype=dtype) * dtype(bits)
-
-    return np.bitwise_or.reduce(padded << shifts, axis=-1)

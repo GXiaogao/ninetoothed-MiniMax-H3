@@ -5,7 +5,6 @@ import pytest
 
 import ninetoothed.language as ntl
 from ninetoothed import Tensor
-from ninetoothed.backends.rvne import pack_spikes, pack_weights
 from ninetoothed.compiler import CompileRequest, compile_kernel
 from ninetoothed.compiler.runtime import materialize
 
@@ -14,17 +13,13 @@ def _identity(*tensors):
     return tensors
 
 
-def _spike_application(current, spikes, low, high, out):
+def _quantized_matmul(current, spikes, weights, out):
+    result = spikes @ weights
+    out = current + result  # noqa: F841
+
+
+def _spike_escape_hatch(current, spikes, low, high, out):
     out = ntl.spike_accumulate(current, spikes, low, high)  # noqa: F841
-
-
-def _dot_application(current, spikes, low, high, out):
-    acc = current
-
-    for block in range(spikes.shape[0]):
-        acc = ntl.spike_accumulate(acc, spikes[block], low[block], high[block])
-
-    out = acc  # noqa: F841
 
 
 def _lif_application(current, voltage, syn_current, spike, next_voltage, next_current):
@@ -43,7 +38,13 @@ def _compile(application, arrays):
         CompileRequest(
             arrangement=_identity,
             application=application,
-            tensors=tuple(Tensor(shape=a.shape, dtype=a.dtype.name) for a in arrays),
+            tensors=tuple(
+                Tensor(
+                    shape=a.shape,
+                    dtype="int4" if a.dtype == np.int8 else a.dtype.name,
+                )
+                for a in arrays
+            ),
             backend="rvne",
             caller="numpy",
         )
@@ -55,105 +56,87 @@ def _require_sdk():
         pytest.skip("RVNE SDK is not configured")
 
 
-@pytest.mark.parametrize("count", (0, 1, 15, 16, 31, 32, 33, 1023, 1024, 1025))
-def test_packing_preserves_bit_order_signed_weights_and_zero_tail(count):
-    spikes = np.arange(count) % 2
-    weights = (np.arange(count) % 16 - 8).astype(np.int32)
-    packed_spikes = pack_spikes(spikes)
-    packed_weights = pack_weights(weights)
-    assert packed_spikes.dtype == np.uint32
-    assert packed_weights.dtype == np.uint64
+def test_rvne_lowers_standard_bool_int4_dot_to_spike_instruction():
+    current = np.zeros((2, 3), dtype=np.int32)
+    spikes = np.array(
+        [
+            [0, 1, 0, 1, 1],
+            [1, 0, 1, 0, 1],
+        ],
+        dtype=bool,
+    )
+    weights = np.arange(-2, 13, dtype=np.int8).reshape(5, 3)
+    out = np.empty_like(current)
+    compilation = _compile(_quantized_matmul, (current, spikes, weights, out))
 
-    for index in range(packed_spikes.size * 32):
-        actual = (int(packed_spikes[index // 32]) >> (index % 32)) & 1
-        assert actual == (int(spikes[index]) if index < count else 0)
-
-    for index in range(packed_weights.size * 16):
-        actual = (int(packed_weights[index // 16]) >> (4 * (index % 16))) & 15
-        actual = actual - 16 if actual >= 8 else actual
-        assert actual == (int(weights[index]) if index < count else 0)
+    assert "__builtin_riscv_calc_acc_32" in compilation.artifact.primary_source
 
 
-@pytest.mark.parametrize(
-    "function,values,error",
-    (
-        (pack_spikes, [0, 2], ValueError),
-        (pack_spikes, [-1, 0], ValueError),
-        (pack_weights, [-9, 7], ValueError),
-        (pack_weights, [-8, 8], ValueError),
-        (pack_weights, [0.5], TypeError),
-        (pack_spikes, [0.0, 1.0], TypeError),
-        (pack_weights, 1, ValueError),
-    ),
-)
-def test_packing_rejects_implicit_quantization(function, values, error):
-    with pytest.raises(error):
-        function(values)
-
-
-def test_spike_primitive_rejects_unpacked_weights():
+def test_rvne_rejects_frontend_spike_escape_hatch():
     arrays = (
         np.zeros(3, dtype=np.int32),
         np.zeros(3, dtype=np.uint32),
-        np.zeros(3, dtype=np.int32),
+        np.zeros(3, dtype=np.uint64),
         np.zeros(3, dtype=np.uint64),
         np.zeros(3, dtype=np.int32),
     )
 
-    with pytest.raises(TypeError, match="packed weight"):
-        _compile(_spike_application, arrays)
+    with pytest.raises(ValueError, match="call.spike_accumulate"):
+        _compile(_spike_escape_hatch, arrays)
 
 
-def test_rvne_spike_intrinsic_qemu_signed_weights_and_accumulation(tmp_path):
+def _reversed_int4_matmul(current, weights, spikes, out):
+    result = weights @ spikes
+    out = current + result  # noqa: F841
+
+
+def _int4_arithmetic(weights, out):
+    out = weights + weights  # noqa: F841
+
+
+def test_rvne_rejects_reversed_and_non_contracted_int4_usage():
+    current = np.zeros((3, 32), dtype=np.int32)
+    spikes = np.ones((2, 32), dtype=bool)
+    weights = np.zeros((3, 2), dtype=np.int8)
+    out = np.empty_like(current)
+
+    with pytest.raises(ValueError, match="bool lhs and int4 rhs"):
+        _compile(_reversed_int4_matmul, (current, weights, spikes, out))
+
+    with pytest.raises(ValueError, match="only valid in bool @ int4 contractions"):
+        _compile(_int4_arithmetic, (weights, weights.copy()))
+
+
+def test_rvne_quantized_dot_qemu_signed_weights_and_long_reduction(tmp_path):
     _require_sdk()
     rng = np.random.default_rng(17)
-    spikes = rng.integers(0, 2, (1025, 32), dtype=np.int32)
-    weights = rng.integers(-8, 8, (1025, 32), dtype=np.int32)
-    current = rng.integers(-100, 100, 1025, dtype=np.int32)
-    spikes[:2] = 1
-    weights[0] = 7
-    weights[1] = -8
-    current[:2] = (np.iinfo(np.int32).max, np.iinfo(np.int32).min)
-    packed = pack_weights(weights)
+    rows, count = 7, 1025
+    spikes = rng.integers(0, 2, (rows, count), dtype=np.int8).astype(bool)
+    weights = rng.integers(-8, 8, (count, 1), dtype=np.int8)
+    current = rng.integers(-100, 100, (rows, 1), dtype=np.int32)
     out = np.zeros_like(current)
-    arrays = (
-        current,
-        pack_spikes(spikes)[:, 0].copy(),
-        packed[:, 0].copy(),
-        packed[:, 1].copy(),
-        out,
-    )
-    compilation = _compile(_spike_application, arrays)
-    assert "__builtin_riscv_calc_acc_32" in compilation.artifact.primary_source
-    handle = materialize(compilation, output_dir=tmp_path, mode="aot")
-    handle(*arrays)
-    expected = current + np.sum(spikes * weights, axis=1, dtype=np.int32)
-    np.testing.assert_array_equal(out, expected)
-
-
-def test_rvne_packed_dot_qemu_exceeds_register_capacity(tmp_path):
-    _require_sdk()
-    rng = np.random.default_rng(21)
-    count, rows = 1025, 7
-    spikes = rng.integers(0, 2, (rows, count), dtype=np.int32)
-    weights = rng.integers(-8, 8, (rows, count), dtype=np.int32)
-    padding = (-count) % 32
-    packed = pack_weights(np.pad(weights, ((0, 0), (0, padding))))
-    current = np.arange(rows, dtype=np.int32)
-    out = np.zeros_like(current)
-    arrays = (
-        current,
-        pack_spikes(spikes).T.copy(),
-        packed[:, ::2].T.copy(),
-        packed[:, 1::2].T.copy(),
-        out,
-    )
+    arrays = (current, spikes, weights, out)
     handle = materialize(
-        _compile(_dot_application, arrays), output_dir=tmp_path, mode="aot"
+        _compile(_quantized_matmul, arrays), output_dir=tmp_path, mode="aot"
     )
     handle(*arrays)
-    expected = current + np.sum(spikes * weights, axis=1, dtype=np.int32)
+    expected = current + (spikes.astype(np.int32) @ weights.astype(np.int32))
     np.testing.assert_array_equal(out, expected)
+
+
+def test_rvne_quantized_dot_qemu_rejects_non_int4_weights(tmp_path):
+    _require_sdk()
+    current = np.zeros((42, 3), dtype=np.int32)
+    spikes = np.ones((1, 32), dtype=bool)
+    weights = np.full((32, 1), 8, dtype=np.int8)
+    out = np.zeros_like(current)
+    arrays = (current, spikes, weights, out)
+    handle = materialize(
+        _compile(_quantized_matmul, arrays), output_dir=tmp_path, mode="aot"
+    )
+
+    with pytest.raises(ValueError, match="values must be in \\[-8, 7\\]"):
+        handle(*arrays)
 
 
 def test_rvne_lif_qemu_preserves_explicit_state_across_timesteps(tmp_path):
@@ -183,42 +166,33 @@ def test_rvne_lif_qemu_preserves_explicit_state_across_timesteps(tmp_path):
         syn_current[:] = next_current
 
 
-def test_rvne_spiking_convolution_qemu_with_explicit_packed_patches(tmp_path):
+def test_rvne_spiking_convolution_qemu_with_standard_matmul(tmp_path):
     _require_sdk()
     import torch
     import torch.nn.functional as functional
 
     rng = np.random.default_rng(31)
-    inputs = rng.integers(0, 2, (1, 5, 6, 7), dtype=np.int32)
-    weights = rng.integers(-8, 8, (3, 5, 3, 3), dtype=np.int32)
+    inputs = rng.integers(0, 2, (1, 5, 6, 7), dtype=np.int32).astype(bool)
+    weights = rng.integers(-8, 8, (3, 5, 3, 3), dtype=np.int8)
     padded_inputs = np.pad(inputs[0], ((0, 0), (1, 1), (1, 1)))
     patches = np.lib.stride_tricks.sliding_window_view(
         padded_inputs, (3, 3), axis=(1, 2)
     )
     patches = patches.transpose(1, 2, 0, 3, 4).reshape(42, 45)
-    spikes = np.tile(patches, (3, 1))
-    row_weights = np.repeat(weights.reshape(3, 45), 42, axis=0)
-    packed = pack_weights(np.pad(row_weights, ((0, 0), (0, 19))))
-    current = np.zeros(126, dtype=np.int32)
+    current = np.zeros((42, 3), dtype=np.int32)
     output = np.zeros_like(current)
-    arrays = (
-        current,
-        pack_spikes(spikes).T.copy(),
-        packed[:, ::2].T.copy(),
-        packed[:, 1::2].T.copy(),
-        output,
-    )
+    arrays = (current, patches, weights.reshape(3, 45).T.copy(), output)
     handle = materialize(
-        _compile(_dot_application, arrays), output_dir=tmp_path, mode="aot"
+        _compile(_quantized_matmul, arrays), output_dir=tmp_path, mode="aot"
     )
     handle(*arrays)
     expected = (
         functional.conv2d(
-            torch.from_numpy(inputs).float(),
-            torch.from_numpy(weights).float(),
+            torch.from_numpy(inputs.astype(np.float32)),
+            torch.from_numpy(weights.astype(np.float32)),
             padding=1,
         )
         .numpy()
         .astype(np.int32)
     )
-    np.testing.assert_array_equal(output.reshape(1, 3, 6, 7), expected)
+    np.testing.assert_array_equal(output.T.reshape(1, 3, 6, 7), expected)

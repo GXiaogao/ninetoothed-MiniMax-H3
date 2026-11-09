@@ -6,8 +6,8 @@ with the RVNE SDK. AOT execution runs through the SDK's user-mode QEMU using
 NumPy host arrays. Source generation does not need the SDK.
 
 The current backend provides scalar RV64 arithmetic, control flow and
-reductions. It also exposes one explicit packed spike-accumulation primitive
-that lowers to the RVNE ``calc_acc_32`` instruction. Integer LIF updates are
+reductions. A ``bool @ int4`` contraction is pattern-matched and lowered to
+the RVNE ``calc_acc_32`` instruction. Integer LIF updates are
 currently expressed with ordinary arithmetic, shifts and ``ntl.where``; they
 do not yet use the dedicated hardware LIF instruction.
 
@@ -61,73 +61,50 @@ integration runner, not an on-device performance benchmark. A compiler or
 emulator failure raises an exception; unsuccessful execution does not replace
 host outputs.
 
-Packed spike accumulation
--------------------------
+Quantized spike contraction
+---------------------------
 
-``ntl.spike_accumulate(current, spikes, weight_low, weight_high)`` is a narrow
-RVNE primitive, not the intended pattern for exposing every hardware feature.
-It exists so the first backend can state the exact packed INT4 ABI and avoid
-silently changing quantization semantics. TODO(rvne): recognize suitable
-already-quantized dot-product and convolution patterns and lower them to this
-primitive; once that path exists, remove the temporary frontend escape hatch.
-Automatic floating-point quantization is outside this backend.
-
-The primitive computes
-``current + sum(spike[i] * weight[i] for i in range(32))`` using the RVNE
-``calc_acc_32`` instruction. Operands have these exact types:
-
-* ``current``: ``int32``.
-* ``spikes``: ``uint32``, with spike zero in the least significant bit.
-* ``weight_low`` and ``weight_high``: ``uint64`` holding sixteen signed INT4
-  weights each, with weight zero in the least significant nibble.
-
-Operands must broadcast to the current tensor's shape. The result has the
-current tensor's shape and ``int32`` dtype. The generated helper initializes
-its temporary RVNE registers on every call and reads NCR with ``get_ncr_64``.
-It does not preserve an external hardware neuron context.
-
-Host-side packing helpers are part of the backend-specific RVNE boundary:
+Applications use ordinary matrix multiplication for an explicitly quantized
+spike contraction: the spike operand has dtype ``bool`` and the weight operand
+has dtype ``int4``. The frontend infers an ``int32`` result, and the RVNE
+emitter pattern-matches this contraction, packs each 32-lane group at runtime,
+and calls ``calc_acc_32``. Nonintegral and implicitly quantized floating-point
+contractions are not lowered to this path.
 
 .. code-block:: python
 
    import numpy as np
-   import ninetoothed.language as ntl
    from ninetoothed import Tensor
-   from ninetoothed.backends.rvne import pack_spikes, pack_weights
    from ninetoothed.aot import aot
 
    def accumulate(
-       current: Tensor(shape=(1,), dtype="int32"),
-       spikes: Tensor(shape=(1,), dtype="uint32"),
-       low: Tensor(shape=(1,), dtype="uint64"),
-       high: Tensor(shape=(1,), dtype="uint64"),
-       out: Tensor(shape=(1,), dtype="int32"),
+       current: Tensor(shape=(2, 3), dtype="int32"),
+       spikes: Tensor(shape=(2, 4), dtype="bool"),
+       weights: Tensor(shape=(4, 3), dtype="int4"),
+       out: Tensor(shape=(2, 3), dtype="int32"),
    ):
-       out = ntl.spike_accumulate(current, spikes, low, high)
+       out = current + (spikes @ weights)
 
    kernel = aot(accumulate, backend="rvne", output_dir="build/rvne")
-   spikes = np.ones((1, 32), dtype=np.int32)
-   weights = np.tile(np.arange(-8, 8, dtype=np.int32), (1, 2))
-   packed_weights = pack_weights(weights)
-   current = np.zeros(1, dtype=np.int32)
-   result = np.zeros_like(current)
-   kernel(
-       current,
-       pack_spikes(spikes)[:, 0].copy(),
-       packed_weights[:, 0].copy(),
-       packed_weights[:, 1].copy(),
-       result,
+   current = np.zeros((2, 3), dtype=np.int32)
+   spikes = np.array(
+       [[0, 1, 0, 1], [1, 0, 1, 0]], dtype=bool
    )
-   np.testing.assert_array_equal(result, [-16])
+   weights = np.arange(-8, 4, dtype=np.int8).reshape(4, 3)
+   out = np.empty_like(current)
+   kernel(current, spikes, weights, out)
+   np.testing.assert_array_equal(
+       out, current + (spikes.astype(np.int32) @ weights.astype(np.int32))
+   )
 
-``pack_spikes`` packs binary values into ``uint32`` words with spike zero in
-bit zero. ``pack_weights`` packs signed INT4 integers into ``uint64`` words,
-lowest nibble first. Both operate on the last axis and pad incomplete words
-with zero. They reject values outside their exact input domains and never
-threshold, round or quantize. Pad weights to a multiple of 32 when pairing
-two weight words with each spike word. Larger dot products can loop over
-packed words while carrying the returned current. Convolution patches and
-dense layers can use the same primitive after explicit layout conversion.
+NumPy has no native signed-INT4 storage, so RVNE represents an ``int4`` kernel
+argument with native ``int8_t`` bytes. Values must already be integers in
+``[-8, 7]``; the runtime rejects anything outside that range instead of
+rounding, clipping, or silently truncating it. Reduction extents that are not a
+multiple of 32 are padded with zero spikes and zero weights inside the generated
+kernel. Convolution patches can use the same lowering after they are explicitly
+gathered into a ``bool @ int4`` matrix multiplication; no frontend accumulator
+intrinsic is exposed.
 
 Support and validation
 ----------------------
@@ -141,8 +118,10 @@ does not silently route unsupported kernels to another backend. Signed
 arithmetic is compiled with ``-fwrapv``. Shift counts must be supported
 compile-time constants.
 
-Supported element types are ``bool``, ``int32``, ``uint32``, ``int64``,
-``uint64`` and ``float32``. The initial arithmetic set includes addition,
+Supported general element types are ``bool``, ``int32``, ``uint32``,
+``int64``, ``uint64`` and ``float32``. ``int4`` is accepted as an explicitly
+quantized weight operand for the ``bool @ int4`` contraction path and is
+carried over the ABI as native ``int8_t`` bytes. The initial arithmetic set includes addition,
 subtraction, multiplication, comparisons, bitwise operations, selection and
 sum/min/max reductions. FP32 ``exp2`` and division are supported; floating
 division also accepts an integer scalar operand. Integer division, floor
@@ -157,13 +136,12 @@ tests:
 
    python -m pytest tests/test_rvne_*.py
 
-These cover ordinary addition, dense matrix multiplication, sum/min/max,
-signed INT4 packing, masked tails, accumulated dot products larger than 1024
-inputs, explicit LIF state across time steps, blocked attention, failure
-handling and artifact reload. QEMU validation does not establish support or
+These cover ordinary addition, ordinary dense matrix multiplication,
+``bool @ int4`` spike contraction, non-32 reduction tails, contractions longer
+than 1024 inputs, explicit LIF state across time steps, blocked attention,
+failure handling and artifact reload. QEMU validation does not establish support or
 timing on a physical chip. Dedicated LIF instructions, hardware launch and
-context management, register-resident batching, and automatic recognition of
-quantized convolution/dot-product patterns remain future optimization work.
+context management, and register-resident batching remain optimization work.
 
 Ordinary operator tests on QEMU
 ------------------------------

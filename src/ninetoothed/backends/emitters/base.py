@@ -147,6 +147,11 @@ class EmitterTarget(ABC):
 
         return None
 
+    def emit_dot(self, operation, context, coords=None):
+        del operation, context, coords
+
+        return None
+
     def emit_reduction_loop(self, local, operation, context):
         del local, operation, context
 

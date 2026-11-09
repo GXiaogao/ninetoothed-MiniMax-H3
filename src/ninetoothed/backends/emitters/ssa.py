@@ -1651,6 +1651,11 @@ def _emit_linalg_dot(
     rhs_axes = _value_axes(rhs, ctx)
     result_axes = tuple(str(dim) for dim in op.results[0].type.shape)
 
+    specialized = ctx.target.emit_dot(op, ctx, coords=coords)
+
+    if specialized is not None:
+        return specialized
+
     if ctx.native_block_program and len(lhs_axes) == 2 and len(rhs_axes) == 2:
         result = ctx.target.emit_block_dot(op, ctx, coords=coords)
 

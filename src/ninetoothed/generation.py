@@ -21,7 +21,7 @@ from ninetoothed.symbol import Symbol
 from ninetoothed.tensor import Tensor
 from ninetoothed.torchifier import Torchifier
 
-CACHE_DIR = pathlib.Path.home() / ".ninetoothed"
+CACHE_DIR = pathlib.Path(__import__("os").environ["NINETOOTHED_CACHE_DIR"])
 CACHE_DIR.mkdir(exist_ok=True)
 
 

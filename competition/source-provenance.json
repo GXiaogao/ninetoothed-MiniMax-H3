@@ -1,0 +1,13 @@
+{
+  "component": "ninetoothed",
+  "upstream_commit": "daf55c76c8e8b50904b0b84678d9bca93a1c8948",
+  "source_scope": "report v0.2 verified candidate, not later Attention/BF16 experiments",
+  "upstream_license_preserved": true,
+  "server_has_git_metadata": false,
+  "no_claim_of_new_binary_build_or_model_correctness": true,
+  "patch": {
+    "original_sha256": "8863013c70fb5bdc131f1078c7b1e0ddbfdd68336a625dfb2811c781e345fe3d",
+    "patched_sha256": "17f908e7ee7ddf9e87f2a2cb51d302d6d2b32211da7735998fbced276b8cbf4e",
+    "scope": "isolated-cache-location-only"
+  }
+}
